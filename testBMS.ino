@@ -7,6 +7,10 @@ NimBLERemoteCharacteristic* dataChar = nullptr;
 
 const int CELL_COUNT = 6;
 
+float batteryCapacity = 40.0;
+float socPercent = 0.0;
+float remainCapacity = 0.0;
+
 float packVoltage = 0.0;
 float cellVoltage[CELL_COUNT] = {0};
 float minCellVoltage = 0.0;
@@ -25,6 +29,7 @@ bool voltageValid = false;
 bool currentValid = false;
 bool balanceCurrentValid = false;
 bool tempValid = false;
+bool socValid = false;
 
 uint8_t requestSettings[] = {
   0xAA, 0x55, 0x90, 0xEB, 0x96, 0x00, 0x79, 0x62, 0x96, 0xED,
@@ -70,18 +75,13 @@ void updateVoltageData(uint8_t* data, size_t len) {
     uint16_t mv = readUInt16LE(data, 6 + i * 2);
     float v = mv / 1000.0;
 
-    if (!isReasonableCellVoltage(v)) {
-      valid = false;
-    }
+    if (!isReasonableCellVoltage(v)) valid = false;
 
     cellVoltage[i] = v;
     total += v;
   }
 
-  if (!valid || !isReasonablePackVoltage(total)) {
-    Serial.println("Voltage frame ignored.");
-    return;
-  }
+  if (!valid || !isReasonablePackVoltage(total)) return;
 
   packVoltage = total;
 
@@ -137,11 +137,24 @@ void updateExtraData(uint8_t* data, size_t len) {
   } else {
     tempValid = false;
   }
+
+  // SoC / Remain Battery valid hanya dari realtime frame xx 5B
+  if (len > 24 && data[1] == 0x5B) {
+    float soc = data[23];
+
+    if (soc >= 0.0 && soc <= 100.0) {
+      socPercent = soc;
+      remainCapacity = batteryCapacity * socPercent / 100.0;
+      socValid = true;
+    } else {
+      socValid = false;
+    }
+  }
 }
 
 void printDataForControl() {
   Serial.println();
-  Serial.println("===== DATA UNTUK KONTROL SISTEM =====");
+  Serial.println("===== DATA BMS =====");
 
   if (voltageValid) {
     Serial.print("Tegangan Total Baterai : ");
@@ -189,6 +202,18 @@ void printDataForControl() {
     Serial.println(" A");
   } else {
     Serial.println("Balance Current        : belum valid");
+  }
+
+  if (socValid) {
+    Serial.print("Remain Battery / SoC   : ");
+    Serial.print(socPercent, 1);
+    Serial.println(" %");
+
+    Serial.print("Remain Capacity        : ");
+    Serial.print(remainCapacity, 2);
+    Serial.println(" Ah");
+  } else {
+    Serial.println("SoC / Remain Capacity  : belum valid");
   }
 
   if (tempValid) {
@@ -334,7 +359,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  Serial.println("JK BMS BLE FINAL DATA READER");
+  Serial.println("JK BMS BLE FINAL DATA READER + SOC");
 
   NimBLEDevice::init("");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
