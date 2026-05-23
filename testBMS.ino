@@ -7,10 +7,6 @@ NimBLERemoteCharacteristic* dataChar = nullptr;
 
 const int CELL_COUNT = 6;
 
-float batteryCapacity = 40.0;
-float socPercent = 0.0;
-float remainCapacity = 0.0;
-
 float packVoltage = 0.0;
 float cellVoltage[CELL_COUNT] = {0};
 float minCellVoltage = 0.0;
@@ -137,19 +133,6 @@ void updateExtraData(uint8_t* data, size_t len) {
   } else {
     tempValid = false;
   }
-
-  // SoC / Remain Battery valid hanya dari realtime frame xx 5B
-  if (len > 24 && data[1] == 0x5B) {
-    float soc = data[23];
-
-    if (soc >= 0.0 && soc <= 100.0) {
-      socPercent = soc;
-      remainCapacity = batteryCapacity * socPercent / 100.0;
-      socValid = true;
-    } else {
-      socValid = false;
-    }
-  }
 }
 
 void printDataForControl() {
@@ -204,17 +187,6 @@ void printDataForControl() {
     Serial.println("Balance Current        : belum valid");
   }
 
-  if (socValid) {
-    Serial.print("Remain Battery / SoC   : ");
-    Serial.print(socPercent, 1);
-    Serial.println(" %");
-
-    Serial.print("Remain Capacity        : ");
-    Serial.print(remainCapacity, 2);
-    Serial.println(" Ah");
-  } else {
-    Serial.println("SoC / Remain Capacity  : belum valid");
-  }
 
   if (tempValid) {
     Serial.print("Battery T1             : ");
