@@ -4,6 +4,7 @@
 #include <NimBLEDevice.h>
 #include <ESP32Encoder.h>
 #include "esp_eap_client.h"
+#include <time.h>
 
 // =====================================================
 // WIFI WPA2 ENTERPRISE + MQTT CONFIG
@@ -18,15 +19,65 @@ const char* MQTT_HOST = "36fbe5a880964afa839f722d0eb4f7f5.s1.eu.hivemq.cloud";
 const uint16_t MQTT_PORT = 8883;
 
 const char* MQTT_CLIENT_ID = "esp32-bms-01";
-const char* MQTT_USERNAME = "hivemq.webclient.1780377319539";
-const char* MQTT_PASSWORD = "6t,5HoQV.s?D7#b0GdSc";
+const char* MQTT_USERNAME = "hivemq.webclient.1780374811805";
+const char* MQTT_PASSWORD = "oHO:S4<Gqdcj#W839hQ>";
 
 const char* MQTT_TOPIC_DATA   = "skripsi/bms01/data";
 const char* MQTT_TOPIC_STATUS = "skripsi/bms01/status";
+const char* MQTT_TOPIC_CONTROL = "skripsi/bms01/control";
 
 const unsigned long MQTT_PUBLISH_INTERVAL_MS = 1000;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
+
+// ================= CONTROL MODE CONFIG =================
+// AUTO   : sistem aktif otomatis dari jam 07:00 sampai 20:00.
+// MANUAL : sistem mengikuti tombol ON/OFF dari MQTT.
+enum ControlMode {
+  CONTROL_AUTO,
+  CONTROL_MANUAL
+};
+
+ControlMode controlMode = CONTROL_AUTO;
+bool manualPower = false;
+bool scheduleActive = false;
+bool systemAllowed = false;
+
+const int SCHEDULE_START_HOUR = 7;
+const int SCHEDULE_STOP_HOUR  = 19;
+const long GMT_OFFSET_SEC = 7 * 3600;
+const int DAYLIGHT_OFFSET_SEC = 0;
+
+const char* controlModeToString() {
+  switch (controlMode) {
+    case CONTROL_AUTO: return "AUTO";
+    case CONTROL_MANUAL: return "MANUAL";
+    default: return "UNKNOWN";
+  }
+}
+
+void updateScheduleState() {
+  struct tm timeinfo;
+
+  if (!getLocalTime(&timeinfo, 100)) {
+    scheduleActive = false;
+    return;
+  }
+
+  int hour = timeinfo.tm_hour;
+  scheduleActive = (hour >= SCHEDULE_START_HOUR && hour < SCHEDULE_STOP_HOUR);
+}
+
+void updateSystemAllowed() {
+  updateScheduleState();
+
+  if (controlMode == CONTROL_AUTO) {
+    systemAllowed = scheduleActive;
+  } else {
+    systemAllowed = manualPower;
+  }
+}
+
 
 WiFiClientSecure wifiClient;
 PubSubClient mqttClient(wifiClient);
@@ -221,9 +272,74 @@ void maintainWiFi() {
   }
 }
 
+
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  if (String(topic) != MQTT_TOPIC_CONTROL) return;
+
+  char msg[160];
+  unsigned int copyLen = length;
+
+  if (copyLen >= sizeof(msg)) {
+    copyLen = sizeof(msg) - 1;
+  }
+
+  memcpy(msg, payload, copyLen);
+  msg[copyLen] = '\0';
+
+  String command = String(msg);
+  command.toLowerCase();
+
+  // Format utama:
+  // {"mode":"auto"}
+  // {"mode":"manual","power":true}
+  // {"mode":"manual","power":false}
+  //
+  // Format tambahan yang tetap diterima:
+  // {"mode":"toggle"}
+  // on
+  // off
+
+  if (command.indexOf("auto") >= 0) {
+    controlMode = CONTROL_AUTO;
+  } else if (command.indexOf("manual") >= 0) {
+    controlMode = CONTROL_MANUAL;
+
+    if (command.indexOf("true") >= 0 || command.indexOf("on") >= 0) {
+      manualPower = true;
+    } else if (command.indexOf("false") >= 0 || command.indexOf("off") >= 0) {
+      manualPower = false;
+    }
+  } else if (command.indexOf("toggle") >= 0) {
+    controlMode = CONTROL_MANUAL;
+    manualPower = !manualPower;
+  } else if (command.indexOf("on") >= 0) {
+    controlMode = CONTROL_MANUAL;
+    manualPower = true;
+  } else if (command.indexOf("off") >= 0) {
+    controlMode = CONTROL_MANUAL;
+    manualPower = false;
+  }
+
+  updateSystemAllowed();
+
+  if (!systemAllowed) {
+    systemMode = MODE_SAFE_OFF;
+    allRelayOff();
+  }
+
+  Serial.print("Control Mode: ");
+  Serial.print(controlModeToString());
+  Serial.print(" | Manual Power: ");
+  Serial.println(manualPower ? "ON" : "OFF");
+
+  mqttClient.publish(MQTT_TOPIC_STATUS, controlModeToString(), true);
+}
+
+
 void setupMQTT() {
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setBufferSize(1024);
+  mqttClient.setCallback(onMqttMessage);
 }
 
 void maintainMQTT() {
@@ -253,6 +369,7 @@ void maintainMQTT() {
   if (connected) {
     Serial.println("connected.");
     mqttClient.publish(MQTT_TOPIC_STATUS, "online", true);
+    mqttClient.subscribe(MQTT_TOPIC_CONTROL);
   } else {
     Serial.print("failed, rc=");
     Serial.println(mqttClient.state());
@@ -299,7 +416,11 @@ void publishMQTTData() {
       "\"position_deg\":%.2f,"
       "\"system_mode\":\"%s\","
       "\"relay_load\":%s,"
-      "\"relay_charge\":%s"
+      "\"relay_charge\":%s,"
+      "\"control_mode\":\"%s\","
+      "\"manual_power\":%s,"
+      "\"schedule_active\":%s,"
+      "\"system_allowed\":%s"
     "}",
     now,
     isBMSTimeout() ? "true" : "false",
@@ -328,7 +449,11 @@ void publishMQTTData() {
     positionDeg,
     systemModeToString(),
     loadRelayOn ? "true" : "false",
-    chargeRelayOn ? "true" : "false"
+    chargeRelayOn ? "true" : "false",
+    controlModeToString(),
+    manualPower ? "true" : "false",
+    scheduleActive ? "true" : "false",
+    systemAllowed ? "true" : "false"
   );
 
   bool ok = mqttClient.publish(MQTT_TOPIC_DATA, payload, false);
@@ -458,6 +583,8 @@ bool isOverTemp() {
 
 // ================= RELAY CONTROL =================
 void controlRelays() {
+  updateSystemAllowed();
+
   if (!voltageValid || isBMSTimeout()) {
     systemMode = MODE_SAFE_OFF;
     allRelayOff();
@@ -465,6 +592,12 @@ void controlRelays() {
   }
 
   if (isOverTemp()) {
+    systemMode = MODE_SAFE_OFF;
+    allRelayOff();
+    return;
+  }
+
+  if (!systemAllowed) {
     systemMode = MODE_SAFE_OFF;
     allRelayOff();
     return;
@@ -608,6 +741,18 @@ void printDataForControl() {
   } else {
     Serial.println("Temperatur             : belum valid");
   }
+
+  Serial.print("Mode Kontrol           : ");
+  Serial.println(controlModeToString());
+
+  Serial.print("Manual Power           : ");
+  Serial.println(manualPower ? "ON" : "OFF");
+
+  Serial.print("Jadwal Aktif           : ");
+  Serial.println(scheduleActive ? "YES" : "NO");
+
+  Serial.print("System Allowed         : ");
+  Serial.println(systemAllowed ? "YES" : "NO");
 
   Serial.print("Mode Sistem            : ");
   Serial.println(systemModeToString());
@@ -771,6 +916,8 @@ void setup() {
   wifiClient.setInsecure();
 
   setupWiFi();
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, "pool.ntp.org", "time.google.com");
+  updateSystemAllowed();
   setupMQTT();
 
   NimBLEDevice::init("");
