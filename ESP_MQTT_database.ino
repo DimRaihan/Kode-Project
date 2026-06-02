@@ -1,42 +1,34 @@
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <NimBLEDevice.h>
 #include <ESP32Encoder.h>
+#include "esp_eap_client.h"
 
 // =====================================================
-// WIFI + MQTT CONFIG
+// WIFI WPA2 ENTERPRISE + MQTT CONFIG
 // =====================================================
-// Ganti sesuai jaringan dan broker yang lu pakai.
-// Untuk HiveMQ Cloud biasanya:
-// MQTT_HOST = "xxxxxxxx.s1.eu.hivemq.cloud"
-// MQTT_PORT = 8883
-// MQTT_USE_TLS = true
-//
-// Untuk broker lokal / Mosquitto / HiveMQ public biasanya:
-// MQTT_PORT = 1883
-// MQTT_USE_TLS = false
-
 const char* WIFI_SSID = "eduroam";
-const char* WIFI_PASSWORD = "Raihananhar##23076";
+
+#define EAP_IDENTITY "dimas.anhar@mhs.unsoed.ac.id"
+#define EAP_USERNAME "dimas.anhar@mhs.unsoed.ac.id"
+#define EAP_PASSWORD "Raihananhar##23076"
 
 const char* MQTT_HOST = "36fbe5a880964afa839f722d0eb4f7f5.s1.eu.hivemq.cloud";
 const uint16_t MQTT_PORT = 8883;
 
 const char* MQTT_CLIENT_ID = "esp32-bms-01";
-const char* MQTT_USERNAME = "hivemq.webclient.1780374811805";   // kosongkan kalau broker tidak pakai username
-const char* MQTT_PASSWORD = "oHO:S4<Gqdcj#W839hQ>";   // kosongkan kalau broker tidak pakai password
+const char* MQTT_USERNAME = "hivemq.webclient.1780377319539";
+const char* MQTT_PASSWORD = "6t,5HoQV.s?D7#b0GdSc";
 
 const char* MQTT_TOPIC_DATA   = "skripsi/bms01/data";
 const char* MQTT_TOPIC_STATUS = "skripsi/bms01/status";
 
-// Interval publish ke MQTT.
-// Saran awal: 1000 ms kalau ingin data time-series rapih untuk database.
-// Kalau koneksi kurang stabil, naikkan ke 2000-5000 ms.
 const unsigned long MQTT_PUBLISH_INTERVAL_MS = 1000;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
 
-WiFiClient wifiClient;
+WiFiClientSecure wifiClient;
 PubSubClient mqttClient(wifiClient);
 
 unsigned long lastWifiReconnectAttempt = 0;
@@ -66,8 +58,6 @@ float positionDeg = 0.0;
 
 const int PPR = 1000;
 const int QUAD_MULTIPLIER = 4;
-
-// Filter RPM
 const float RPM_FILTER_ALPHA = 0.25;
 
 // ================= PIN RELAY =================
@@ -163,6 +153,11 @@ bool isReasonableTemp(float t) {
   return t >= 10.0 && t <= 80.0;
 }
 
+bool isBMSTimeout() {
+  if (lastBMSDataTime == 0) return true;
+  return millis() - lastBMSDataTime > BMS_TIMEOUT_MS;
+}
+
 const char* systemModeToString() {
   switch (systemMode) {
     case MODE_LOAD: return "LOAD";
@@ -176,13 +171,27 @@ const char* systemModeToString() {
 
 // ================= WIFI + MQTT FUNCTION =================
 void setupWiFi() {
+  Serial.println();
+  Serial.println("Connecting to WPA2-Enterprise WiFi...");
+
+  WiFi.disconnect(true);
+  delay(1000);
+
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setSleep(false);
+
+  esp_eap_client_set_identity((uint8_t*)EAP_IDENTITY, strlen(EAP_IDENTITY));
+  esp_eap_client_set_username((uint8_t*)EAP_USERNAME, strlen(EAP_USERNAME));
+  esp_eap_client_set_password((uint8_t*)EAP_PASSWORD, strlen(EAP_PASSWORD));
+
+  esp_wifi_sta_enterprise_enable();
+
+  WiFi.begin(WIFI_SSID);
 
   Serial.print("Connecting WiFi");
   unsigned long startAttempt = millis();
 
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000) {
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 20000) {
     Serial.print(".");
     delay(500);
   }
@@ -203,9 +212,12 @@ void maintainWiFi() {
   unsigned long now = millis();
   if (now - lastWifiReconnectAttempt >= WIFI_RECONNECT_INTERVAL_MS) {
     lastWifiReconnectAttempt = now;
-    Serial.println("Reconnecting WiFi...");
-    WiFi.disconnect();
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.println("Reconnecting WPA2-Enterprise WiFi...");
+
+    WiFi.disconnect(false);
+    delay(500);
+
+    WiFi.begin(WIFI_SSID);
   }
 }
 
@@ -228,26 +240,15 @@ void maintainMQTT() {
 
   Serial.print("Connecting MQTT... ");
 
-  bool connected;
-  if (strlen(MQTT_USERNAME) > 0) {
-    connected = mqttClient.connect(
-      MQTT_CLIENT_ID,
-      MQTT_USERNAME,
-      MQTT_PASSWORD,
-      MQTT_TOPIC_STATUS,
-      1,
-      true,
-      "offline"
-    );
-  } else {
-    connected = mqttClient.connect(
-      MQTT_CLIENT_ID,
-      MQTT_TOPIC_STATUS,
-      1,
-      true,
-      "offline"
-    );
-  }
+  bool connected = mqttClient.connect(
+    MQTT_CLIENT_ID,
+    MQTT_USERNAME,
+    MQTT_PASSWORD,
+    MQTT_TOPIC_STATUS,
+    1,
+    true,
+    "offline"
+  );
 
   if (connected) {
     Serial.println("connected.");
@@ -258,9 +259,6 @@ void maintainMQTT() {
   }
 }
 
-// Format JSON dibuat flat supaya gampang diparse Node-RED/Telegraf ke InfluxDB.
-// Field "timestamp_ms" dari millis ESP32, bukan timestamp absolut.
-// Timestamp absolut sebaiknya dibuat di Node-RED/Telegraf/server saat data masuk.
 void publishMQTTData() {
   if (!mqttClient.connected()) return;
 
@@ -359,11 +357,6 @@ void allRelayOff() {
   updateRelayOutput();
 }
 
-bool isBMSTimeout() {
-  if (lastBMSDataTime == 0) return true;
-  return millis() - lastBMSDataTime > BMS_TIMEOUT_MS;
-}
-
 // ================= ENCODER FUNCTION =================
 void updateEncoderData() {
   unsigned long now = millis();
@@ -373,15 +366,12 @@ void updateEncoderData() {
     long delta = count - last_count;
 
     rpmRaw = (delta / (float)(PPR * QUAD_MULTIPLIER)) * 600.0;
-
     rpm = (RPM_FILTER_ALPHA * rpmRaw) + ((1.0 - RPM_FILTER_ALPHA) * rpm);
 
     long countPerRev = PPR * QUAD_MULTIPLIER;
     long normalizedCount = count % countPerRev;
 
-    if (normalizedCount < 0) {
-      normalizedCount += countPerRev;
-    }
+    if (normalizedCount < 0) normalizedCount += countPerRev;
 
     positionDeg = normalizedCount * (360.0 / countPerRev);
 
@@ -777,6 +767,8 @@ void setup() {
 
   Serial.println("Encoder PCNT ready");
   Serial.println("JK BMS BLE + SAFETY RELAY CONTROL + ENCODER + MQTT");
+
+  wifiClient.setInsecure();
 
   setupWiFi();
   setupMQTT();
