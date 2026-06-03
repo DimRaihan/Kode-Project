@@ -166,7 +166,14 @@ const float PACK_CHARGE_STOP_V  = 24.6;
 const float TEMP_OFF_C = 55.0;
 
 const unsigned long RELAY_SWITCH_DELAY_MS = 3000;
+
+// Minimum waktu charge.
+// Tujuannya agar setelah relay charge sempat ON, sistem tidak langsung pindah ke relay beban
+// hanya karena tegangan baterai naik sesaat / voltage rebound.
+const unsigned long MIN_CHARGE_TIME_MS = 5UL * 60UL * 1000UL;  // 5 menit
 unsigned long transitionStart = 0;
+unsigned long chargeModeStart = 0;
+bool chargeMinTimerActive = false;
 
 // ================= BMS REQUEST FRAME =================
 uint8_t requestSettings[] = {
@@ -218,6 +225,20 @@ const char* systemModeToString() {
     case MODE_SAFE_OFF: return "SAFE_OFF";
     default: return "UNKNOWN";
   }
+}
+
+bool isMinimumChargeTimeDone() {
+  if (!chargeMinTimerActive) return true;
+  return millis() - chargeModeStart >= MIN_CHARGE_TIME_MS;
+}
+
+unsigned long getRemainingMinChargeSeconds() {
+  if (!chargeMinTimerActive) return 0;
+
+  unsigned long elapsed = millis() - chargeModeStart;
+  if (elapsed >= MIN_CHARGE_TIME_MS) return 0;
+
+  return (MIN_CHARGE_TIME_MS - elapsed) / 1000UL;
 }
 
 // ================= WIFI + MQTT FUNCTION =================
@@ -276,6 +297,9 @@ void maintainWiFi() {
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   if (String(topic) != MQTT_TOPIC_CONTROL) return;
 
+  ControlMode previousControlMode = controlMode;
+  bool previousManualPower = manualPower;
+
   char msg[160];
   unsigned int copyLen = length;
 
@@ -321,6 +345,14 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   }
 
   updateSystemAllowed();
+
+  // Saat pindah mode, matikan relay dulu dan paksa state machine evaluasi ulang dari kondisi aman.
+  // Ini mencegah relay beban mempertahankan state lama ketika pindah MANUAL -> AUTO.
+  if (previousControlMode != controlMode || previousManualPower != manualPower) {
+    systemMode = MODE_SAFE_OFF;
+    allRelayOff();
+    transitionStart = millis();
+  }
 
   if (!systemAllowed) {
     systemMode = MODE_SAFE_OFF;
@@ -420,7 +452,9 @@ void publishMQTTData() {
       "\"control_mode\":\"%s\","
       "\"manual_power\":%s,"
       "\"schedule_active\":%s,"
-      "\"system_allowed\":%s"
+      "\"system_allowed\":%s,"
+      "\"charge_min_timer_active\":%s,"
+      "\"charge_min_remaining_sec\":%lu"
     "}",
     now,
     isBMSTimeout() ? "true" : "false",
@@ -453,7 +487,9 @@ void publishMQTTData() {
     controlModeToString(),
     manualPower ? "true" : "false",
     scheduleActive ? "true" : "false",
-    systemAllowed ? "true" : "false"
+    systemAllowed ? "true" : "false",
+    chargeMinTimerActive ? "true" : "false",
+    getRemainingMinChargeSeconds()
   );
 
   bool ok = mqttClient.publish(MQTT_TOPIC_DATA, payload, false);
@@ -613,12 +649,18 @@ void controlRelays() {
 
   unsigned long now = millis();
 
+  // Kalau relay charge pernah masuk, tahan sistem agar tetap kembali ke charge
+  // sampai minimal charging time selesai. Ini menghindari pindah ke LOAD karena voltage rebound.
+  bool chargeMinimumNotDone =
+    chargeMinTimerActive &&
+    (now - chargeModeStart < MIN_CHARGE_TIME_MS);
+
   switch (systemMode) {
     case MODE_SAFE_OFF:
       allRelayOff();
 
       if (voltageValid && !isBMSTimeout() && !isOverTemp()) {
-        if (batteryLow) {
+        if (batteryLow || (chargeMinimumNotDone && !batteryFull)) {
           transitionStart = now;
           systemMode = MODE_TRANSITION_TO_CHARGE;
         } else {
@@ -632,7 +674,7 @@ void controlRelays() {
       loadRelayOn = true;
       chargeRelayOn = false;
 
-      if (batteryLow) {
+      if (batteryLow || (chargeMinimumNotDone && !batteryFull)) {
         allRelayOff();
         transitionStart = now;
         systemMode = MODE_TRANSITION_TO_CHARGE;
@@ -645,6 +687,14 @@ void controlRelays() {
       if (now - transitionStart >= RELAY_SWITCH_DELAY_MS) {
         chargeRelayOn = true;
         loadRelayOn = false;
+
+        // Timer dimulai hanya saat benar-benar masuk mode charge.
+        // Kalau timer sebelumnya masih aktif, jangan di-reset supaya hitungan 5 menit tetap lanjut.
+        if (!chargeMinTimerActive || now - chargeModeStart >= MIN_CHARGE_TIME_MS) {
+          chargeModeStart = now;
+          chargeMinTimerActive = true;
+        }
+
         systemMode = MODE_CHARGE;
         updateRelayOutput();
       }
@@ -654,15 +704,28 @@ void controlRelays() {
       chargeRelayOn = true;
       loadRelayOn = false;
 
+      // Safety tetap prioritas: kalau sudah mencapai batas penuh, charge wajib berhenti
+      // meskipun belum 5 menit.
       if (batteryFull) {
+        chargeMinTimerActive = false;
         allRelayOff();
         transitionStart = now;
         systemMode = MODE_TRANSITION_TO_LOAD;
       }
+
+      // Kalau belum full, jangan pindah ke LOAD hanya karena tegangan naik sesaat.
+      // Sistem tetap CHARGE sampai batteryFull tercapai.
       break;
 
     case MODE_TRANSITION_TO_LOAD:
       allRelayOff();
+
+      // Kalau dalam masa minimum charge dan baterai belum full, batalkan transisi ke LOAD.
+      if (chargeMinimumNotDone && !batteryFull) {
+        transitionStart = now;
+        systemMode = MODE_TRANSITION_TO_CHARGE;
+        break;
+      }
 
       if (now - transitionStart >= RELAY_SWITCH_DELAY_MS) {
         loadRelayOn = true;
@@ -762,6 +825,12 @@ void printDataForControl() {
 
   Serial.print("Relay Charge           : ");
   Serial.println(chargeRelayOn ? "ON" : "OFF");
+
+  Serial.print("Timer Minimum Charge   : ");
+  Serial.print(chargeMinTimerActive ? "ACTIVE" : "INACTIVE");
+  Serial.print(" | Sisa ");
+  Serial.print(getRemainingMinChargeSeconds());
+  Serial.println(" detik");
 
   Serial.print("RPM Filtered           : ");
   Serial.println(rpm, 2);
