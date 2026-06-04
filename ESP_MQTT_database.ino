@@ -190,9 +190,28 @@ const unsigned long RELAY_SWITCH_DELAY_MS = 3000;
 // Tujuannya agar setelah relay charge sempat ON, sistem tidak langsung pindah ke relay beban
 // hanya karena tegangan baterai naik sesaat / voltage rebound.
 const unsigned long MIN_CHARGE_TIME_MS = 5UL * 60UL * 1000UL;  // 5 menit
+
+// Konfirmasi tegangan.
+// Tujuannya agar relay tidak pindah mode hanya karena noise sesaat atau voltage rebound.
+// LOW dikonfirmasi lebih cepat agar baterai segera dilindungi.
+// FULL dikonfirmasi lebih lama agar charge tidak mati karena spike tegangan sesaat.
+const unsigned long LOW_VOLTAGE_CONFIRM_MS  = 3000;
+const unsigned long FULL_VOLTAGE_CONFIRM_MS = 10000;
+
 unsigned long transitionStart = 0;
 unsigned long chargeModeStart = 0;
 bool chargeMinTimerActive = false;
+
+// Latch/lock mode charge.
+// Jika baterai sudah dikonfirmasi LOW, beban dikunci OFF sampai baterai benar-benar FULL.
+// Ini inti perbaikan untuk mencegah relay beban ON-OFF karena voltage rebound.
+bool chargeLockActive = false;
+bool batteryLowRaw = false;
+bool batteryFullRaw = false;
+bool batteryLowConfirmed = false;
+bool batteryFullConfirmed = false;
+unsigned long batteryLowSince = 0;
+unsigned long batteryFullSince = 0;
 
 // ================= BMS REQUEST FRAME =================
 uint8_t requestSettings[] = {
@@ -258,6 +277,52 @@ unsigned long getRemainingMinChargeSeconds() {
   if (elapsed >= MIN_CHARGE_TIME_MS) return 0;
 
   return (MIN_CHARGE_TIME_MS - elapsed) / 1000UL;
+}
+
+void updateBatteryThresholdState() {
+  unsigned long now = millis();
+
+  batteryLowRaw =
+    minCellVoltage <= CHARGE_START_CELL_V ||
+    packVoltage <= PACK_CHARGE_START_V;
+
+  batteryFullRaw =
+    maxCellVoltage >= CHARGE_STOP_CELL_V ||
+    packVoltage >= PACK_CHARGE_STOP_V;
+
+  if (batteryLowRaw) {
+    if (batteryLowSince == 0) batteryLowSince = now;
+  } else {
+    batteryLowSince = 0;
+  }
+
+  if (batteryFullRaw) {
+    if (batteryFullSince == 0) batteryFullSince = now;
+  } else {
+    batteryFullSince = 0;
+  }
+
+  batteryLowConfirmed =
+    batteryLowRaw &&
+    batteryLowSince != 0 &&
+    now - batteryLowSince >= LOW_VOLTAGE_CONFIRM_MS;
+
+  batteryFullConfirmed =
+    batteryFullRaw &&
+    batteryFullSince != 0 &&
+    now - batteryFullSince >= FULL_VOLTAGE_CONFIRM_MS;
+
+  // Begitu LOW valid, kunci sistem ke charge.
+  // Jangan buka lock hanya karena tegangan naik sesaat setelah beban OFF.
+  if (batteryLowConfirmed) {
+    chargeLockActive = true;
+  }
+
+  // Lock baru dilepas kalau FULL sudah stabil.
+  if (batteryFullConfirmed) {
+    chargeLockActive = false;
+    chargeMinTimerActive = false;
+  }
 }
 
 // ================= WIFI + MQTT FUNCTION =================
@@ -475,6 +540,11 @@ void publishMQTTData() {
       "\"load_allowed\":%s,"
       "\"charge_allowed\":%s,"
       "\"night_charge_mode\":%s,"
+      "\"battery_low_raw\":%s,"
+      "\"battery_low_confirmed\":%s,"
+      "\"battery_full_raw\":%s,"
+      "\"battery_full_confirmed\":%s,"
+      "\"charge_lock_active\":%s,"
       "\"charge_min_timer_active\":%s,"
       "\"charge_min_remaining_sec\":%lu"
     "}",
@@ -513,6 +583,11 @@ void publishMQTTData() {
     loadAllowed ? "true" : "false",
     chargeAllowed ? "true" : "false",
     nightChargeMode ? "true" : "false",
+    batteryLowRaw ? "true" : "false",
+    batteryLowConfirmed ? "true" : "false",
+    batteryFullRaw ? "true" : "false",
+    batteryFullConfirmed ? "true" : "false",
+    chargeLockActive ? "true" : "false",
     chargeMinTimerActive ? "true" : "false",
     getRemainingMinChargeSeconds()
   );
@@ -648,12 +723,16 @@ void controlRelays() {
 
   if (!voltageValid || isBMSTimeout()) {
     systemMode = MODE_SAFE_OFF;
+    chargeLockActive = false;
+    chargeMinTimerActive = false;
     allRelayOff();
     return;
   }
 
   if (isOverTemp()) {
     systemMode = MODE_SAFE_OFF;
+    chargeLockActive = false;
+    chargeMinTimerActive = false;
     allRelayOff();
     return;
   }
@@ -665,33 +744,29 @@ void controlRelays() {
     return;
   }
 
-  bool batteryLow =
-    minCellVoltage <= CHARGE_START_CELL_V ||
-    packVoltage <= PACK_CHARGE_START_V;
-
-  bool batteryFull =
-    maxCellVoltage >= CHARGE_STOP_CELL_V ||
-    packVoltage >= PACK_CHARGE_STOP_V;
+  updateBatteryThresholdState();
 
   unsigned long now = millis();
 
-  // Kalau relay charge pernah masuk, tahan sistem agar tetap kembali ke charge
-  // sampai minimal charging time selesai. Ini menghindari pindah ke LOAD karena voltage rebound.
   bool chargeMinimumNotDone =
     chargeMinTimerActive &&
     (now - chargeModeStart < MIN_CHARGE_TIME_MS);
 
-  // Di luar jam AUTO, beban/motor tidak boleh ON.
-  // Namun relay charge tetap boleh ON jika batteryLow atau timer minimum charge belum selesai.
+  // Inti perbaikan:
+  // shouldCharge memakai chargeLockActive, bukan tegangan sesaat.
+  // Jadi setelah baterai LOW, sistem tetap CHARGE sampai FULL stabil.
   bool shouldCharge =
     chargeAllowed &&
-    !batteryFull &&
-    (batteryLow || chargeMinimumNotDone);
+    !batteryFullConfirmed &&
+    (chargeLockActive || chargeMinimumNotDone);
 
+  // Beban hanya boleh ON kalau tidak ada charge lock dan tidak dalam timer minimum charge.
+  // Ini mencegah beban hidup lagi akibat voltage rebound.
   bool shouldLoad =
     loadAllowed &&
-    !batteryLow &&
-    !chargeMinimumNotDone;
+    !chargeLockActive &&
+    !chargeMinimumNotDone &&
+    !batteryLowConfirmed;
 
   switch (systemMode) {
     case MODE_SAFE_OFF:
@@ -704,13 +779,16 @@ void controlRelays() {
         transitionStart = now;
         systemMode = MODE_TRANSITION_TO_LOAD;
       } else {
-        // Contoh kondisi AUTO malam dan baterai belum drop:
+        // AUTO malam dan baterai belum low:
         // relay beban OFF, relay charge OFF, ESP32 tetap monitoring + publish data.
         systemMode = MODE_SAFE_OFF;
       }
       break;
 
     case MODE_LOAD:
+      loadRelayOn = true;
+      chargeRelayOn = false;
+
       // Jika jadwal AUTO sudah lewat jam 19:00, atau manual dimatikan,
       // beban/motor wajib OFF.
       if (!loadAllowed) {
@@ -725,9 +803,8 @@ void controlRelays() {
         break;
       }
 
-      loadRelayOn = true;
-      chargeRelayOn = false;
-
+      // Saat LOW sudah confirmed, langsung matikan beban dan masuk transisi charge.
+      // Karena chargeLockActive sudah ON, beban tidak akan nyala lagi walaupun tegangan rebound.
       if (shouldCharge) {
         allRelayOff();
         transitionStart = now;
@@ -738,8 +815,15 @@ void controlRelays() {
     case MODE_TRANSITION_TO_CHARGE:
       allRelayOff();
 
-      if (!shouldCharge && !batteryLow) {
-        systemMode = MODE_SAFE_OFF;
+      // Jangan batalkan transisi hanya karena batteryLowRaw hilang akibat rebound.
+      // Batalkan hanya kalau charge memang tidak diizinkan lagi atau baterai sudah full confirmed.
+      if (!shouldCharge) {
+        if (shouldLoad) {
+          transitionStart = now;
+          systemMode = MODE_TRANSITION_TO_LOAD;
+        } else {
+          systemMode = MODE_SAFE_OFF;
+        }
         break;
       }
 
@@ -747,8 +831,8 @@ void controlRelays() {
         chargeRelayOn = true;
         loadRelayOn = false;
 
-        // Timer dimulai hanya saat benar-benar masuk mode charge.
-        // Kalau timer sebelumnya masih aktif, jangan di-reset supaya hitungan 5 menit tetap lanjut.
+        // Timer dimulai saat benar-benar masuk mode charge.
+        // Kalau timer sebelumnya masih aktif, jangan reset.
         if (!chargeMinTimerActive || now - chargeModeStart >= MIN_CHARGE_TIME_MS) {
           chargeModeStart = now;
           chargeMinTimerActive = true;
@@ -765,15 +849,14 @@ void controlRelays() {
 
       // Kalau izin charge hilang, misalnya manual OFF, charge wajib mati.
       if (!chargeAllowed) {
-        chargeMinTimerActive = false;
         allRelayOff();
         systemMode = MODE_SAFE_OFF;
         break;
       }
 
-      // Safety tetap prioritas: kalau sudah mencapai batas penuh, charge wajib berhenti
-      // meskipun belum 5 menit.
-      if (batteryFull) {
+      // Safety tetap prioritas: charge baru berhenti kalau FULL sudah stabil.
+      if (batteryFullConfirmed) {
+        chargeLockActive = false;
         chargeMinTimerActive = false;
         allRelayOff();
 
@@ -786,7 +869,7 @@ void controlRelays() {
         }
       }
 
-      // Kalau belum full, sistem tetap CHARGE.
+      // Kalau belum full confirmed, sistem tetap CHARGE.
       // Ini sengaja supaya tidak pindah ke LOAD hanya karena voltage rebound.
       break;
 
@@ -804,7 +887,7 @@ void controlRelays() {
         break;
       }
 
-      // Kalau dalam masa minimum charge dan baterai belum full, batalkan transisi ke LOAD.
+      // Kalau charge lock aktif lagi, batalkan transisi ke LOAD.
       if (shouldCharge) {
         transitionStart = now;
         systemMode = MODE_TRANSITION_TO_CHARGE;
@@ -909,6 +992,21 @@ void printDataForControl() {
 
   Serial.print("Night Charge Mode      : ");
   Serial.println(nightChargeMode ? "YES" : "NO");
+
+  Serial.print("Battery Low Raw        : ");
+  Serial.println(batteryLowRaw ? "YES" : "NO");
+
+  Serial.print("Battery Low Confirmed  : ");
+  Serial.println(batteryLowConfirmed ? "YES" : "NO");
+
+  Serial.print("Battery Full Raw       : ");
+  Serial.println(batteryFullRaw ? "YES" : "NO");
+
+  Serial.print("Battery Full Confirmed : ");
+  Serial.println(batteryFullConfirmed ? "YES" : "NO");
+
+  Serial.print("Charge Lock Active     : ");
+  Serial.println(chargeLockActive ? "YES" : "NO");
 
   Serial.print("Mode Sistem            : ");
   Serial.println(systemModeToString());
