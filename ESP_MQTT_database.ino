@@ -31,7 +31,8 @@ const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
 
 // ================= CONTROL MODE CONFIG =================
-// AUTO   : sistem aktif otomatis dari jam 07:00 sampai 20:00.
+// AUTO   : jam 07:00-19:00 beban/motor boleh ON.
+//          di luar jam itu beban/motor OFF, tetapi charge tetap boleh ON jika baterai drop.
 // MANUAL : sistem mengikuti tombol ON/OFF dari MQTT.
 enum ControlMode {
   CONTROL_AUTO,
@@ -42,6 +43,14 @@ ControlMode controlMode = CONTROL_AUTO;
 bool manualPower = false;
 bool scheduleActive = false;
 bool systemAllowed = false;
+
+// loadAllowed  : izin untuk menyalakan relay beban/motor.
+// chargeAllowed: izin untuk menyalakan relay charge.
+// Pada AUTO malam, loadAllowed=false tetapi chargeAllowed=true,
+// sehingga motor OFF tetapi baterai tetap bisa recovery charge jika drop.
+bool loadAllowed = false;
+bool chargeAllowed = false;
+bool nightChargeMode = false;
 
 const int SCHEDULE_START_HOUR = 7;
 const int SCHEDULE_STOP_HOUR  = 19;
@@ -72,10 +81,20 @@ void updateSystemAllowed() {
   updateScheduleState();
 
   if (controlMode == CONTROL_AUTO) {
-    systemAllowed = scheduleActive;
+    // Siang: beban/motor boleh jalan, charge juga boleh jalan jika baterai drop.
+    // Malam: beban/motor OFF, tetapi charge tetap boleh jalan jika baterai drop.
+    loadAllowed = scheduleActive;
+    chargeAllowed = true;
+    nightChargeMode = !scheduleActive;
   } else {
-    systemAllowed = manualPower;
+    // Manual OFF benar-benar mematikan sistem.
+    // Manual ON memberi izin beban dan charge, tetapi safety BMS tetap berlaku.
+    loadAllowed = manualPower;
+    chargeAllowed = manualPower;
+    nightChargeMode = false;
   }
+
+  systemAllowed = loadAllowed || chargeAllowed;
 }
 
 
@@ -453,6 +472,9 @@ void publishMQTTData() {
       "\"manual_power\":%s,"
       "\"schedule_active\":%s,"
       "\"system_allowed\":%s,"
+      "\"load_allowed\":%s,"
+      "\"charge_allowed\":%s,"
+      "\"night_charge_mode\":%s,"
       "\"charge_min_timer_active\":%s,"
       "\"charge_min_remaining_sec\":%lu"
     "}",
@@ -488,6 +510,9 @@ void publishMQTTData() {
     manualPower ? "true" : "false",
     scheduleActive ? "true" : "false",
     systemAllowed ? "true" : "false",
+    loadAllowed ? "true" : "false",
+    chargeAllowed ? "true" : "false",
+    nightChargeMode ? "true" : "false",
     chargeMinTimerActive ? "true" : "false",
     getRemainingMinChargeSeconds()
   );
@@ -633,6 +658,7 @@ void controlRelays() {
     return;
   }
 
+  // Kalau manual OFF, atau semua izin mati, sistem benar-benar OFF.
   if (!systemAllowed) {
     systemMode = MODE_SAFE_OFF;
     allRelayOff();
@@ -655,26 +681,54 @@ void controlRelays() {
     chargeMinTimerActive &&
     (now - chargeModeStart < MIN_CHARGE_TIME_MS);
 
+  // Di luar jam AUTO, beban/motor tidak boleh ON.
+  // Namun relay charge tetap boleh ON jika batteryLow atau timer minimum charge belum selesai.
+  bool shouldCharge =
+    chargeAllowed &&
+    !batteryFull &&
+    (batteryLow || chargeMinimumNotDone);
+
+  bool shouldLoad =
+    loadAllowed &&
+    !batteryLow &&
+    !chargeMinimumNotDone;
+
   switch (systemMode) {
     case MODE_SAFE_OFF:
       allRelayOff();
 
-      if (voltageValid && !isBMSTimeout() && !isOverTemp()) {
-        if (batteryLow || (chargeMinimumNotDone && !batteryFull)) {
-          transitionStart = now;
-          systemMode = MODE_TRANSITION_TO_CHARGE;
-        } else {
-          transitionStart = now;
-          systemMode = MODE_TRANSITION_TO_LOAD;
-        }
+      if (shouldCharge) {
+        transitionStart = now;
+        systemMode = MODE_TRANSITION_TO_CHARGE;
+      } else if (shouldLoad) {
+        transitionStart = now;
+        systemMode = MODE_TRANSITION_TO_LOAD;
+      } else {
+        // Contoh kondisi AUTO malam dan baterai belum drop:
+        // relay beban OFF, relay charge OFF, ESP32 tetap monitoring + publish data.
+        systemMode = MODE_SAFE_OFF;
       }
       break;
 
     case MODE_LOAD:
+      // Jika jadwal AUTO sudah lewat jam 19:00, atau manual dimatikan,
+      // beban/motor wajib OFF.
+      if (!loadAllowed) {
+        allRelayOff();
+
+        if (shouldCharge) {
+          transitionStart = now;
+          systemMode = MODE_TRANSITION_TO_CHARGE;
+        } else {
+          systemMode = MODE_SAFE_OFF;
+        }
+        break;
+      }
+
       loadRelayOn = true;
       chargeRelayOn = false;
 
-      if (batteryLow || (chargeMinimumNotDone && !batteryFull)) {
+      if (shouldCharge) {
         allRelayOff();
         transitionStart = now;
         systemMode = MODE_TRANSITION_TO_CHARGE;
@@ -683,6 +737,11 @@ void controlRelays() {
 
     case MODE_TRANSITION_TO_CHARGE:
       allRelayOff();
+
+      if (!shouldCharge && !batteryLow) {
+        systemMode = MODE_SAFE_OFF;
+        break;
+      }
 
       if (now - transitionStart >= RELAY_SWITCH_DELAY_MS) {
         chargeRelayOn = true;
@@ -704,24 +763,49 @@ void controlRelays() {
       chargeRelayOn = true;
       loadRelayOn = false;
 
+      // Kalau izin charge hilang, misalnya manual OFF, charge wajib mati.
+      if (!chargeAllowed) {
+        chargeMinTimerActive = false;
+        allRelayOff();
+        systemMode = MODE_SAFE_OFF;
+        break;
+      }
+
       // Safety tetap prioritas: kalau sudah mencapai batas penuh, charge wajib berhenti
       // meskipun belum 5 menit.
       if (batteryFull) {
         chargeMinTimerActive = false;
         allRelayOff();
-        transitionStart = now;
-        systemMode = MODE_TRANSITION_TO_LOAD;
+
+        if (loadAllowed) {
+          transitionStart = now;
+          systemMode = MODE_TRANSITION_TO_LOAD;
+        } else {
+          // AUTO malam: setelah penuh, jangan pindah ke beban.
+          systemMode = MODE_SAFE_OFF;
+        }
       }
 
-      // Kalau belum full, jangan pindah ke LOAD hanya karena tegangan naik sesaat.
-      // Sistem tetap CHARGE sampai batteryFull tercapai.
+      // Kalau belum full, sistem tetap CHARGE.
+      // Ini sengaja supaya tidak pindah ke LOAD hanya karena voltage rebound.
       break;
 
     case MODE_TRANSITION_TO_LOAD:
       allRelayOff();
 
+      // Kalau jadwal sudah lewat atau manual OFF, jangan lanjut ke beban.
+      if (!loadAllowed) {
+        if (shouldCharge) {
+          transitionStart = now;
+          systemMode = MODE_TRANSITION_TO_CHARGE;
+        } else {
+          systemMode = MODE_SAFE_OFF;
+        }
+        break;
+      }
+
       // Kalau dalam masa minimum charge dan baterai belum full, batalkan transisi ke LOAD.
-      if (chargeMinimumNotDone && !batteryFull) {
+      if (shouldCharge) {
         transitionStart = now;
         systemMode = MODE_TRANSITION_TO_CHARGE;
         break;
@@ -816,6 +900,15 @@ void printDataForControl() {
 
   Serial.print("System Allowed         : ");
   Serial.println(systemAllowed ? "YES" : "NO");
+
+  Serial.print("Load Allowed           : ");
+  Serial.println(loadAllowed ? "YES" : "NO");
+
+  Serial.print("Charge Allowed         : ");
+  Serial.println(chargeAllowed ? "YES" : "NO");
+
+  Serial.print("Night Charge Mode      : ");
+  Serial.println(nightChargeMode ? "YES" : "NO");
 
   Serial.print("Mode Sistem            : ");
   Serial.println(systemModeToString());
