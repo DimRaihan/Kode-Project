@@ -11,9 +11,9 @@
 // =====================================================
 const char* WIFI_SSID = "eduroam";
 
-#define EAP_IDENTITY "dimas.anhar@mhs.unsoed.ac.id"
-#define EAP_USERNAME "dimas.anhar@mhs.unsoed.ac.id"
-#define EAP_PASSWORD "Raihananhar##23076"
+#define EAP_IDENTITY "email unsoed"
+#define EAP_USERNAME "email unsoed"
+#define EAP_PASSWORD "pw email"
 
 const char* MQTT_HOST = "36fbe5a880964afa839f722d0eb4f7f5.s1.eu.hivemq.cloud";
 const uint16_t MQTT_PORT = 8883;
