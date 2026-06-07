@@ -2,7 +2,7 @@
 isian kode buat project penelitian digital battery twin
 
 #Tampilan Dashboard
-<img width="1032" height="1829" alt="IMG20260607140405" src="https://github.com/user-attachments/assets/6cb7bdd5-a5be-448a-958f-152f718511b7" />
+<img width="1910" height="918" alt="Screenshot 2026-06-07 174410" src="https://github.com/user-attachments/assets/d982c3d3-23ba-46a0-9f36-d565d5a730cd" />
 <img width="1886" height="678" alt="Screenshot 2026-06-07 174418" src="https://github.com/user-attachments/assets/ede08c04-c250-4987-b88f-15555b219f57" />
 
 #Rangkaian
